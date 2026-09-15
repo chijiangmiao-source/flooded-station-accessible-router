@@ -3,7 +3,7 @@ import { Board } from './components/Board'
 import { CellEditor, DirPicker } from './components/CellEditor'
 import { RoutePanel } from './components/RoutePanel'
 import { floodScenario, plainScenario, Scenario } from './presets'
-import { solve } from './solver'
+import { useSolver } from './useSolver'
 import {
   FieldError,
   MAX_COST,
@@ -15,7 +15,7 @@ import {
   defaultCell,
   validateDoc,
 } from './validation'
-import { Dir, SolveResult } from './types'
+import { Dir } from './types'
 
 type PickMode = 'start' | 'goal' | null
 
@@ -35,13 +35,13 @@ export default function App() {
   })
   const [selected, setSelected] = useState<number | null>(null)
   const [pickMode, setPickMode] = useState<PickMode>(null)
-  // result === undefined 表示尚未求解（或编辑后已清空）
-  const [result, setResult] = useState<SolveResult | undefined>(undefined)
+  // 求解在 Web Worker 中进行；任何编辑调用 clear() 让旧路线立即消失
+  const { busy, result, run, clear } = useSolver()
 
   const validated = useMemo(() => validateDoc(doc), [doc])
 
-  /** 任何会改变问题的编辑都必须让旧路线立即消失。 */
-  const invalidate = (): void => setResult(undefined)
+  /** 任何会改变问题的编辑都必须让旧路线立即消失（并作废迟到的 Worker 结果）。 */
+  const invalidate = (): void => clear()
 
   const badFields = useMemo(() => {
     const m = new Map<number, Set<string>>()
@@ -137,17 +137,16 @@ export default function App() {
     if (!validated.grid) return // 字段非法时不求解
     if (endpointIssues.length > 0) return
     const { start, goal, dir } = endpoints
-    const res = solve(validated.grid, {
+    run(validated.grid, {
       startR: start!.r,
       startC: start!.c,
       goalR: goal!.r,
       goalC: goal!.c,
       startDir: dir,
     })
-    setResult(res)
   }
 
-  const clearResult = (): void => setResult(undefined)
+  const clearResult = (): void => clear()
 
   // 路线覆盖（用于棋盘角标）
   const routeIndex = useMemo(() => {
@@ -237,10 +236,10 @@ export default function App() {
               >
                 {pickMode === 'goal' ? '请在网格点选终点…' : '点选终点'}
               </button>
-              <button type="button" data-action="solve" onClick={runSolve}>
-                求解 / 复核
+              <button type="button" data-action="solve" onClick={runSolve} disabled={busy}>
+                {busy ? '计算中…（仍可编辑）' : '求解 / 复核'}
               </button>
-              <button type="button" data-action="clear" onClick={clearResult}>
+              <button type="button" data-action="clear" onClick={clearResult} disabled={busy}>
                 清空结果
               </button>
               <button type="button" onClick={() => loadScenario(floodScenario())}>

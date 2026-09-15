@@ -1,0 +1,27 @@
+# 车站无障碍通道暴雨复核器
+#
+# 启动页面：  docker compose up --build
+# 宿主端口：  由环境变量 WEB_PORT 覆盖（默认 8080）
+#             WEB_PORT=9000 docker compose up --build
+# 一次性验收：docker compose run --rm verify
+#   （类型检查 → Vitest 单元/差分测试 → Playwright 端到端，结束即退出）
+
+services:
+  web:
+    build:
+      context: .
+      target: web
+    image: station-rechecker-web
+    ports:
+      # 宿主 ${WEB_PORT} → 容器 80
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: station-rechecker-verify
+    # 一次性服务：跑完验收即退出，不监听端口、不重启
+    restart: "no"
+    command: ["npm", "run", "verify"]

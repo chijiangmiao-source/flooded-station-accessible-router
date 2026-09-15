@@ -1,8 +1,8 @@
 /**
- * 复核求解器。
+ * 复核求解器（不可变标签树实现）。
  *
  * 在增强状态 (位置, 朝向, 已付费电梯组集合) 上做 Dijkstra 最短路。
- * 每“张”状态标签依次比较：
+ * 每个状态标签依次比较：
  *   1. 总秒数（最小）
  *   2. 转弯数（最小）
  *   3. 从起点起逐项比较 (行号, 列号) 坐标序列，字典序取小
@@ -12,15 +12,23 @@
  *   - 同组电梯换乘：仅可从电梯格出发，到达同组任意另一部电梯，
  *     固定 8 秒，朝向不变；该组首次乘用额外加收一次等待秒数。
  *
- * 所有边费用为正（行走至少 1 秒，换乘 8 秒），因此总时间为 t 的标签
- * 只能由总时间小于 t 的标签生成；按 (总秒数, 转弯数) 排序的 Dijkstra
- * 在弹出任何时间 t 的标签之前，时间 t 的全部候选都已入堆，第三级
- * 坐标序列字典序可在松弛时直接比较定论。坐标序列的字典序在“追加
- * 相同后缀”下保持不变，故每个状态只保留三级最优标签是安全的。
+ * 实现要点
+ * --------
+ *  - 状态用稠密整数 sid 索引，距离/转弯/节点指针均为定长整型数组，
+ *    不使用 Map，避免大规模状态下的装箱与散列开销。
+ *  - 每个被采纳的“到达事件”是标签树上的一个不可变节点，只记录
+ *    父节点与本步费用，任何后继节点都不会改写它（杜绝前驱指针
+ *    被后续松弛覆盖导致的链别名问题）。
+ *  - 坐标序列的字典序通过树上最近公共祖先（LCA，倍增法）在
+ *    O(log n) 内比较，无需重建整条序列。两条同终点序列在 LCA
+ *    之后的第一个分叉节点决定大小；一条是另一条严格前缀时，把
+ *    短者判为“更大”（等价于结尾放 +∞ 终结符）。该约定保证
+ *    “追加同一后缀”保持偏序，故每个状态只保留一张最优标签是
+ *    安全的；且所有边费用为正，到达同一终点的等总秒数路线不可
+ *    能互为前缀，终点裁决与题目“逐项比较取小者”完全等价。
  */
 
 import {
-  Cell,
   DIR_DELTA,
   Dir,
   ElevatorCell,
@@ -31,48 +39,181 @@ import {
   ELEVATOR_FARE,
 } from './types'
 
-const POS_BITS = 9 // 20*20 = 400 < 512
-const POS_MASK = (1 << POS_BITS) - 1
+const LOG = 20 // 2^20 超过标签树最大可能深度
+const CHUNK_BITS = 16
+const CHUNK = 1 << CHUNK_BITS
+const CHUNK_MASK = CHUNK - 1
+const INF = 0x3f3f3f3f
 
-function makeKey(pos: number, dir: Dir, paid: number): number {
-  return pos | (dir << POS_BITS) | (paid << (POS_BITS + 2))
+/** 分块定长整型数组：按需分配，避免一次性巨型连续内存。 */
+class Chunks {
+  private cs: Int32Array[] = []
+  private readonly fillValue: number
+
+  constructor(fillValue = 0) {
+    this.fillValue = fillValue
+  }
+
+  private ensure(i: number): Int32Array {
+    const ci = i >> CHUNK_BITS
+    let a = this.cs[ci]
+    if (!a) {
+      a = new Int32Array(CHUNK)
+      if (this.fillValue !== 0) a.fill(this.fillValue)
+      this.cs[ci] = a
+    }
+    return a
+  }
+
+  get(i: number): number {
+    const a = this.cs[i >> CHUNK_BITS]
+    return a ? a[i & CHUNK_MASK] : this.fillValue
+  }
+
+  set(i: number, v: number): void {
+    this.ensure(i)[i & CHUNK_MASK] = v
+  }
 }
 
-function keyPos(key: number): number {
-  return key & POS_MASK
-}
-function keyDir(key: number): Dir {
-  return ((key >> POS_BITS) & 3) as Dir
-}
-function keyPaid(key: number): number {
-  return key >> (POS_BITS + 2)
+const VIA_WALK = 0
+const VIA_RIDE = 1
+
+/**
+ * 不可变标签树：节点只增不改。
+ * 每个节点记录所在格、父节点、树深与来源边费用；up[k] 为向上
+ * 2^k 层祖先，用于 O(log n) 的 LCA 与序列字典序比较。
+ */
+class NodeTree {
+  readonly pos = new Chunks()
+  readonly parent = new Chunks(-1)
+  readonly depth = new Chunks()
+  readonly base = new Chunks()
+  readonly turn = new Chunks()
+  readonly fare = new Chunks()
+  readonly wait = new Chunks()
+  readonly group = new Chunks()
+  readonly via = new Chunks()
+  private readonly up: Chunks[] = []
+  count = 0
+
+  constructor() {
+    for (let k = 0; k < LOG; k++) this.up.push(new Chunks(-1))
+  }
+
+  add(
+    pos: number,
+    parentNode: number,
+    via: number,
+    base: number,
+    turn: number,
+    fare: number,
+    wait: number,
+    group: number,
+  ): number {
+    const id = this.count++
+    this.pos.set(id, pos)
+    this.base.set(id, base)
+    this.turn.set(id, turn)
+    this.fare.set(id, fare)
+    this.wait.set(id, wait)
+    this.group.set(id, group)
+    this.via.set(id, via)
+    if (parentNode < 0) {
+      this.parent.set(id, -1)
+      this.depth.set(id, 0)
+      return id
+    }
+    this.parent.set(id, parentNode)
+    const d = this.depth.get(parentNode) + 1
+    this.depth.set(id, d)
+    this.up[0].set(id, parentNode)
+    // 仅实际可达的层级才会分配分块
+    for (let k = 1; k < LOG; k++) {
+      const mid = this.up[k - 1].get(id)
+      if (mid < 0) break
+      this.up[k].set(id, this.up[k - 1].get(mid))
+    }
+    return id
+  }
+
+  private lift(node: number, targetDepth: number): number {
+    let d = this.depth.get(node) - targetDepth
+    let n = node
+    for (let k = 0; d > 0; k++, d >>= 1) {
+      if (d & 1) n = this.up[k].get(n)
+    }
+    return n
+  }
+
+  private lca(a: number, b: number): number {
+    const da = this.depth.get(a)
+    const db = this.depth.get(b)
+    let x = da > db ? this.lift(a, db) : a
+    let y = db > da ? this.lift(b, da) : b
+    if (x === y) return x
+    for (let k = LOG - 1; k >= 0; k--) {
+      const ux = this.up[k].get(x)
+      const uy = this.up[k].get(y)
+      if (ux !== uy) {
+        x = ux
+        y = uy
+      }
+    }
+    return this.up[0].get(x)
+  }
+
+  /**
+   * 比较两条根→节点坐标序列的字典序（pos 行优先，数值序即
+   * (行号, 列号) 逐项序）。-1：x 更小；1：更大；0：同一节点。
+   * 严格前缀按 +∞ 终结符约定判为“更大”。
+   */
+  compareSeq(x: number, y: number): number {
+    if (x === y) return 0
+    const w = this.lca(x, y)
+    if (w === x) return 1
+    if (w === y) return -1
+    const wd = this.depth.get(w)
+    const cx = this.pos.get(this.lift(x, wd + 1))
+    const cy = this.pos.get(this.lift(y, wd + 1))
+    return cx < cy ? -1 : cx > cy ? 1 : 0
+  }
+
+  /**
+   * 比较“候选序列 seq(parent)+[npos]”与在位序列 seq(old)，
+   * 不创建候选节点。
+   */
+  compareExtension(parentNode: number, npos: number, old: number): number {
+    if (parentNode === old) {
+      // P+[npos] 与 Q 完全同长同项（终点状态位置相同）
+      return 0
+    }
+    const w = this.lca(parentNode, old)
+    if (w === old) {
+      // old 是 parent 的严格前缀（正费用下不会出现，理论上候选更优）
+      return -1
+    }
+    if (w === parentNode) {
+      // 共同前缀到 parent：先比较追加的第一项
+      const wd = this.depth.get(parentNode)
+      const childPos = this.pos.get(this.lift(old, wd + 1))
+      if (npos !== childPos) return npos < childPos ? -1 : 1
+      // 第一项相同：若 old 链更长，候选是其严格前缀 → 短者更大
+      return this.depth.get(old) === wd + 1 ? 0 : 1
+    }
+    // 分叉位于两条前缀内部：追加终点不改变首个差异
+    return this.compareSeq(parentNode, old)
+  }
 }
 
-type MoveKind = 'start' | 'walk' | 'elevator'
-
-/** 到达某状态时的最优标签及其来源边。 */
-interface Label {
-  key: number
-  time: number
-  turns: number
-  pred: number // 前驱状态 key，起点为 -1
-  via: MoveKind
-  base: number // 来源边的基础耗时
-  turn: number // 来源边的转弯费
-  fare: number // 来源边的电梯费（8，首次乘用时另含等待）
-  wait: number // 来源边中首次等待部分
-  group: number // 电梯换乘组号（否则 0）
-  gen: number // 堆条目代号：标签每被替换一次加 1
-}
-
+/** 最小二叉堆：A* 键 (f=g+h, sid)。 */
 interface HeapEntry {
-  key: number
+  sid: number
   time: number
   turns: number
-  gen: number
+  node: number
+  f: number
 }
 
-/** 最小二叉堆：按 (总秒数, 转弯数, key) 排序（路径序列不参与堆序）。 */
 class MinHeap {
   private a: HeapEntry[] = []
 
@@ -93,9 +234,8 @@ class MinHeap {
     }
   }
 
-  pop(): HeapEntry | undefined {
+  pop(): HeapEntry {
     const a = this.a
-    if (a.length === 0) return undefined
     const top = a[0]
     const last = a.pop()!
     if (a.length > 0) {
@@ -104,10 +244,10 @@ class MinHeap {
       const n = a.length
       for (;;) {
         const l = 2 * i + 1
-        const r = l + 1
+        const rr = l + 1
         let m = i
         if (l < n && this.less(a[l], a[m])) m = l
-        if (r < n && this.less(a[r], a[m])) m = r
+        if (rr < n && this.less(a[rr], a[m])) m = rr
         if (m === i) break
         ;[a[i], a[m]] = [a[m], a[i]]
         i = m
@@ -117,43 +257,9 @@ class MinHeap {
   }
 
   private less(x: HeapEntry, y: HeapEntry): boolean {
-    if (x.time !== y.time) return x.time < y.time
-    if (x.turns !== y.turns) return x.turns < y.turns
-    return x.key < y.key
+    if (x.f !== y.f) return x.f < y.f
+    return x.sid < y.sid
   }
-}
-
-/** 沿前驱链重建坐标序列 [r0,c0,r1,c1,...]（含起点，前驱在前）。 */
-function coordChain(labels: Map<number, Label>, key: number, cols: number): number[] {
-  const seq: number[] = []
-  let k = key
-  while (k !== -1) {
-    const lab = labels.get(k)!
-    const pos = keyPos(lab.key)
-    seq.push((pos / cols) | 0, pos % cols)
-    k = lab.pred
-  }
-  seq.reverse()
-  return seq
-}
-
-/**
- * 坐标序列字典序：逐项比较，首个不同的 (行,列) 决定大小。
- * 当一条序列是另一条的严格前缀时，把较短者判为“更大”（等价于在结尾
- * 放置 +∞ 终结符）。该约定使偏序在“追加相同后缀”下保持不变：
- *   A ≤ B ⇒ A+suffix ≤ B+suffix
- * 这是按状态只保留一张标签所必需的（否则中间标签被替换后，延伸到
- * 终点的最优链可能被破坏）。而到同一终点的等总秒数路线不可能互为
- * 前缀——所有边费用为正，前缀路线必然更便宜——所以终点裁决与题目
- * 要求的“逐项比较取小者”完全等价。
- */
-function compareSeq(a: number[], b: number[]): number {
-  const n = Math.min(a.length, b.length)
-  for (let i = 0; i < n; i++) {
-    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1
-  }
-  if (a.length !== b.length) return a.length < b.length ? 1 : -1
-  return 0
 }
 
 export interface SolveOptions {
@@ -166,110 +272,220 @@ export interface SolveOptions {
 
 export function solve(grid: Grid, opt: SolveOptions): SolveResult {
   const { rows, cols, cells } = grid
+  const cellCount = cells.length
   const startPos = opt.startR * cols + opt.startC
   const goalPos = opt.goalR * cols + opt.goalC
 
-  const toResult = (reachable: boolean, total: number, turns: number, steps: RouteStep[]): SolveResult => {
-    const { seen, count } = floodReachSet(grid, startPos)
-    return { reachable, total, turns, steps, reachableCount: count, reachSeen: seen }
-  }
+  const reach = floodReachSet(grid, startPos)
+  let blockedCount = 0
+  for (const c of cells) if (c.kind === 'blocked') blockedCount++
+  const fail = (): SolveResult => ({
+    reachable: false,
+    total: 0,
+    turns: 0,
+    steps: [],
+    reachableCount: reach.count,
+    reachSeen: reach.seen,
+    blockedCount,
+  })
 
   if (cells[startPos].kind === 'blocked' || cells[goalPos].kind === 'blocked') {
-    return toResult(false, 0, 0, [])
+    return fail()
   }
 
-  // 各组电梯位置与等待秒数（同组等待一致性由校验层保证）。
-  const groupOf = new Int8Array(cells.length) // 0 表示不在任何组
+  // 洪水连通与 Dijkstra 使用完全相同的边（正交非阻断 + 同组电梯）。
+  // 终点不在可达集合内时，最短路不存在，无需再做状态空间搜索——
+  // 这也避免了“终点隔离 + 多组电梯”时对全部掩码状态的无效展开。
+  if (reach.seen[goalPos] === 0) {
+    return fail()
+  }
+
+  // 同组电梯成员与等待秒数（一致性由校验层保证）。
+  // 掩码只按“实际出现的组”分配位，避免无电梯时状态无谓膨胀。
   const members: number[][] = []
-  const groupWait: number[] = [0]
-  for (let p = 0; p < cells.length; p++) {
+  const groupWait = new Int32Array(10)
+  const groupLocal = new Int8Array(10).fill(-1)
+  const presentGroups: number[] = []
+  for (let p = 0; p < cellCount; p++) {
     const cell = cells[p]
     if (cell.kind === 'elevator') {
-      const g = cell.group
-      groupOf[p] = g
-      if (!members[g]) {
-        members[g] = []
-        groupWait[g] = cell.wait
+      ;(members[cell.group] ??= []).push(p)
+      groupWait[cell.group] = cell.wait
+      if (groupLocal[cell.group] < 0) {
+        groupLocal[cell.group] = presentGroups.length
+        presentGroups.push(cell.group)
       }
-      members[g].push(p)
+    }
+  }
+  const masks = 1 << presentGroups.length // 0 组时为 1
+
+  /**
+   * A* 可采纳启发值 h[pos]：在“只看位置”的松弛问题上（忽略朝向、
+   * 转弯费与首次等待，正交边按目标格耗时、同组电梯 8）到终点的最短
+   * 秒数。松弛问题的每条边费都不大于真实边费，故 h 是真实剩余费用
+   * 的下界，且满足一致性（h 本身是最短路距离）。
+   * 反向求解：从终点出发，松弛边 v→u 的权 = 正向 u→v 的目标格费
+   * cost(v)；同组电梯成员之间权 8。
+   */
+  const h = new Float64Array(cellCount).fill(Infinity)
+  {
+    const pq: { p: number; d: number }[] = []
+    const pushPq = (p: number, d: number): void => {
+      pq.push({ p, d })
+      let i = pq.length - 1
+      while (i > 0 && pq[i].d < pq[(i - 1) >> 1].d) {
+        const pi = (i - 1) >> 1
+        ;[pq[i], pq[pi]] = [pq[pi], pq[i]]
+        i = pi
+      }
+    }
+    h[goalPos] = 0
+    pushPq(goalPos, 0)
+    while (pq.length > 0) {
+      let top = 0
+      const cur = pq[0]
+      const last = pq.pop()!
+      if (pq.length > 0) {
+        pq[0] = last
+        for (;;) {
+          const l = 2 * top + 1
+          const rr = l + 1
+          let m = top
+          if (l < pq.length && pq[l].d < pq[m].d) m = l
+          if (rr < pq.length && pq[rr].d < pq[m].d) m = rr
+          if (m === top) break
+          ;[pq[m], pq[top]] = [pq[top], pq[m]]
+          top = m
+        }
+      }
+      if (cur.d !== h[cur.p]) continue
+      const v = cur.p
+      const vr = (v / cols) | 0
+      const vc = v % cols
+      const forwardDestCost = cells[v].kind === 'blocked' ? 0 : (cells[v] as { cost: number }).cost
+      // 反向正交边：u→v 正向花费 cost(v)
+      for (const [dr, dc] of DIR_DELTA) {
+        const ur = vr + dr
+        const uc = vc + dc
+        if (ur < 0 || ur >= rows || uc < 0 || uc >= cols) continue
+        const u = ur * cols + uc
+        if (cells[u].kind === 'blocked') continue
+        const nd = cur.d + forwardDestCost
+        if (nd < h[u]) {
+          h[u] = nd
+          pushPq(u, nd)
+        }
+      }
+      // 反向同组电梯：费用 8
+      const vCell = cells[v]
+      if (vCell.kind === 'elevator') {
+        for (const u of members[vCell.group]) {
+          if (u === v) continue
+          const nd = cur.d + ELEVATOR_FARE
+          if (nd < h[u]) {
+            h[u] = nd
+            pushPq(u, nd)
+          }
+        }
+      }
     }
   }
 
-  const labels = new Map<number, Label>()
+  // sid = (pos*4 + dir)*masks + mask
+  const stateCount = cellCount * 4 * masks
+  const sidOf = (pos: number, dir: Dir, mask: number): number =>
+    (pos * 4 + dir) * masks + mask
+
+  const bestTime = new Int32Array(stateCount)
+  const bestTurns = new Int32Array(stateCount)
+  const bestNode = new Int32Array(stateCount)
+  bestTime.fill(INF)
+  bestTurns.fill(INF)
+  bestNode.fill(-1)
+
+  const tree = new NodeTree()
   const heap = new MinHeap()
 
-  const startKey = makeKey(startPos, opt.startDir, 0)
-  labels.set(startKey, {
-    key: startKey,
-    time: 0,
-    turns: 0,
-    pred: -1,
-    via: 'start',
-    base: 0,
-    turn: 0,
-    fare: 0,
-    wait: 0,
-    group: 0,
-    gen: 0,
-  })
-  heap.push({ key: startKey, time: 0, turns: 0, gen: 0 })
+  const startSid = sidOf(startPos, opt.startDir, 0)
+  const startNode = tree.add(startPos, -1, VIA_WALK, 0, 0, 0, 0, 0)
+  bestTime[startSid] = 0
+  bestTurns[startSid] = 0
+  bestNode[startSid] = startNode
+  heap.push({ sid: startSid, time: 0, turns: 0, node: startNode, f: h[startPos] })
 
   const relax = (
-    pred: Label,
-    nextPos: number,
-    nextDir: Dir,
-    nextPaid: number,
+    fromNode: number,
+    fromTime: number,
+    fromTurns: number,
+    npos: number,
+    ndir: Dir,
+    nmask: number,
     edgeTime: number,
     edgeTurns: number,
-    via: MoveKind,
+    via: number,
     base: number,
     turn: number,
     fare: number,
     wait: number,
     group: number,
   ): void => {
-    const nk = makeKey(nextPos, nextDir, nextPaid)
-    const nt = pred.time + edgeTime
-    const nTurns = pred.turns + edgeTurns
-    const old = labels.get(nk)
+    const nsid = sidOf(npos, ndir, nmask)
+    const nt = fromTime + edgeTime
+    const ntn = fromTurns + edgeTurns
+    const oldNode = bestNode[nsid]
+
     let better: boolean
-    if (!old) {
+    if (oldNode < 0) {
       better = true
-    } else if (nt !== old.time) {
-      better = nt < old.time
-    } else if (nTurns !== old.turns) {
-      better = nTurns < old.turns
+    } else if (nt !== bestTime[nsid]) {
+      better = nt < bestTime[nsid]
+    } else if (ntn !== bestTurns[nsid]) {
+      better = ntn < bestTurns[nsid]
     } else {
-      // 第三级：逐项比较坐标序列。候选标签临时挂表以便沿前驱链重建。
-      const cand: Label = {
-        key: nk, time: nt, turns: nTurns, pred: pred.key, via,
-        base, turn, fare, wait, group, gen: 0,
-      }
-      labels.set(nk, cand)
-      const sNew = coordChain(labels, nk, cols)
-      labels.set(nk, old)
-      const sOld = coordChain(labels, old.key, cols)
-      better = compareSeq(sNew, sOld) < 0
+      better = tree.compareExtension(fromNode, npos, oldNode) < 0
     }
-    if (better) {
-      const gen = old ? old.gen + 1 : 0
-      labels.set(nk, {
-        key: nk, time: nt, turns: nTurns, pred: pred.key, via,
-        base, turn, fare, wait, group, gen,
-      })
-      heap.push({ key: nk, time: nt, turns: nTurns, gen })
-    }
+    if (!better) return
+
+    // 仅对被采纳的标签创建节点：不可变、永不被改写
+    const node = tree.add(npos, fromNode, via, base, turn, fare, wait, group)
+    bestTime[nsid] = nt
+    bestTurns[nsid] = ntn
+    bestNode[nsid] = node
+    heap.push({ sid: nsid, time: nt, turns: ntn, node, f: nt + h[npos] })
   }
 
-  while (heap.size > 0) {
-    const e = heap.pop()!
-    const lab = labels.get(e.key)
-    // 过时条目（标签已被更优者替换）
-    if (!lab || lab.gen !== e.gen) continue
+  let goalBestTime = INF
+  let goalBestTurns = INF
+  let goalBestNode = -1
 
-    const pos = keyPos(e.key)
-    const dir = keyDir(e.key)
-    const paid = keyPaid(e.key)
+  while (heap.size > 0) {
+    const e = heap.pop()
+    if (bestNode[e.sid] !== e.node) continue // 已被替换的过时堆条目
+
+    // A* 终止：h 一致且非负。首个弹出的终点给出最短总秒数 G*；
+    // 处理完所有 f == G* 的状态即可覆盖等秒数路线的转弯数与字典序
+    // 裁决；f > G* 的状态到终点必超过 G*，无需再处理。
+    if (goalBestNode >= 0 && e.f > goalBestTime) break
+
+    const mask = e.sid % masks
+    const q = (e.sid / masks) | 0
+    const dir = (q % 4) as Dir
+    const pos = (q / 4) | 0
+
+    if (pos === goalPos) {
+      let take = false
+      if (goalBestNode < 0) take = true
+      else if (e.time !== goalBestTime) take = e.time < goalBestTime
+      else if (e.turns !== goalBestTurns) take = e.turns < goalBestTurns
+      else take = tree.compareSeq(e.node, goalBestNode) < 0
+      if (take) {
+        goalBestTime = e.time
+        goalBestTurns = e.turns
+        goalBestNode = e.node
+      }
+      continue // 终点不再扩展（边费用为正）
+    }
+
     const r = (pos / cols) | 0
     const c = pos % cols
 
@@ -280,117 +496,105 @@ export function solve(grid: Grid, opt: SolveOptions): SolveResult {
       const nc = c + dc
       if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue
       const np = nr * cols + nc
-      const target: Cell = cells[np]
+      const target = cells[np]
       if (target.kind === 'blocked') continue
       const turned = d !== dir
       relax(
-        lab, np, d, paid,
+        e.node, e.time, e.turns,
+        np, d, mask,
         target.cost + (turned ? TURN_PENALTY : 0),
         turned ? 1 : 0,
-        'walk', target.cost, turned ? TURN_PENALTY : 0, 0, 0, 0,
+        VIA_WALK, target.cost, turned ? TURN_PENALTY : 0, 0, 0, 0,
       )
     }
 
-    // 2) 同组电梯换乘（朝向不变，不转弯；首次乘用加收等待）
+    // 2) 同组电梯换乘（朝向不变；首次乘用加收等待）
     const here = cells[pos]
     if (here.kind === 'elevator') {
       const g = here.group
-      const bit = 1 << (g - 1)
-      const first = (paid & bit) === 0
+      const bit = 1 << groupLocal[g]
+      const first = (mask & bit) === 0
       const wait = first ? groupWait[g] : 0
+      const nmask = mask | bit
       for (const np of members[g]) {
         if (np === pos) continue
         relax(
-          lab, np, dir, paid | bit,
+          e.node, e.time, e.turns,
+          np, dir, nmask,
           ELEVATOR_FARE + wait, 0,
-          'elevator', 0, 0, ELEVATOR_FARE + wait, wait, g,
+          VIA_RIDE, 0, 0, ELEVATOR_FARE + wait, wait, g,
         )
       }
     }
   }
 
-  // 在所有“位于终点”的状态标签中选三级字典序最优者
-  let best: Label | null = null
-  let bestSeq: number[] | null = null
-  for (const lab of labels.values()) {
-    if (keyPos(lab.key) !== goalPos) continue
-    let take = false
-    if (!best) {
-      take = true
-    } else if (lab.time !== best.time) {
-      take = lab.time < best.time
-    } else if (lab.turns !== best.turns) {
-      take = lab.turns < best.turns
-    } else {
-      const s = coordChain(labels, lab.key, cols)
-      take = compareSeq(s, bestSeq!) < 0
-      if (take) bestSeq = s
-    }
-    if (take) {
-      best = lab
-      bestSeq = coordChain(labels, lab.key, cols)
-    }
-  }
+  if (goalBestNode < 0) return fail()
 
-  if (!best) {
-    return toResult(false, 0, 0, [])
+  return {
+    reachable: true,
+    total: goalBestTime,
+    turns: goalBestTurns,
+    steps: buildSteps(tree, goalBestNode, grid, opt.startDir),
+    reachableCount: reach.count,
+    reachSeen: reach.seen,
+    blockedCount,
   }
-
-  if ((globalThis as any).__X && goalPos === 8 && rows === 3) {
-    for (const gk of [520, 1032]) {
-      if (!labels.has(gk)) continue
-      console.log('GK', gk, 'coord', JSON.stringify(coordChain(labels, gk, cols)),
-        'built', JSON.stringify(buildSteps(labels, gk, grid).map(x => [x.r, x.c])))
-    }
-  }
-  return toResult(true, best.time, best.turns, buildSteps(labels, best.key, grid))
 }
 
-/** 沿前驱链还原逐步费用明细与累计值。 */
-function buildSteps(labels: Map<number, Label>, goalKey: number, grid: Grid): RouteStep[] {
-  const chain: Label[] = []
-  let k: number = goalKey
-  const bb: number[] = []
-  while (k !== -1) {
-    bb.push(k, labels.get(k)!.pred)
-    chain.push(labels.get(k)!)
-    k = labels.get(k)!.pred
+/** 沿不可变父节点链还原逐步费用明细与累计值。 */
+function buildSteps(tree: NodeTree, goalNode: number, grid: Grid, startDir: Dir): RouteStep[] {
+  const ids: number[] = []
+  let n = goalNode
+  while (n >= 0) {
+    ids.push(n)
+    n = tree.parent.get(n)
   }
-  if ((globalThis as any).__X && (goalKey === 520 || goalKey === 1032)) console.log('BSRAW', goalKey, JSON.stringify(bb))
-  chain.reverse()
+  ids.reverse()
 
   const { cells, cols } = grid
   const out: RouteStep[] = []
   let total = 0
-  for (let i = 0; i < chain.length; i++) {
-    const lab = chain[i]
-    const pos = keyPos(lab.key)
+  let curDir: Dir = startDir
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i]
+    const pos = tree.pos.get(id)
     const r = (pos / cols) | 0
     const c = pos % cols
     if (i === 0) {
       out.push({
-        r, c, dir: keyDir(lab.key),
+        r, c, dir: curDir,
         base: 0, turn: 0, fare: 0, wait: 0, stepCost: 0, total: 0,
         kind: 'start',
       })
       continue
     }
-    total += lab.base + lab.turn + lab.fare
+    const via = tree.via.get(id)
+    if (via === VIA_WALK) {
+      const prevPos = tree.pos.get(ids[i - 1])
+      const dr = r - ((prevPos / cols) | 0)
+      const dc = c - (prevPos % cols)
+      curDir = DIR_DELTA.findIndex(([x, y]) => x === dr && y === dc) as Dir
+    }
+    // 乘梯不改变朝向：curDir 保持
+    const base = tree.base.get(id)
+    const turn = tree.turn.get(id)
+    const fare = tree.fare.get(id)
+    total += base + turn + fare
     const here = cells[pos]
     out.push({
       r,
       c,
-      dir: keyDir(lab.key),
-      base: lab.base,
-      turn: lab.turn,
-      fare: lab.fare,
-      wait: lab.wait,
-      stepCost: lab.base + lab.turn + lab.fare,
+      dir: curDir,
+      base,
+      turn,
+      fare,
+      wait: tree.wait.get(id),
+      stepCost: base + turn + fare,
       total,
-      kind: lab.via === 'elevator' ? 'elevator' : 'walk',
-      group: lab.via === 'elevator' ? lab.group : undefined,
+      kind: via === VIA_RIDE ? 'elevator' : 'walk',
+      group: via === VIA_RIDE ? tree.group.get(id) : undefined,
       enteredGroup:
-        here.kind === 'elevator' && lab.via === 'walk'
+        via === VIA_WALK && here.kind === 'elevator'
           ? (here as ElevatorCell).group
           : undefined,
     })
@@ -400,11 +604,15 @@ function buildSteps(labels: Map<number, Label>, goalKey: number, grid: Grid): Ro
 
 /**
  * 失败证据：在与求解器相同的连通关系（正交相邻 + 同组电梯）上，
- * 从起点做广度优先，返回可达的非阻断格集合与数量。审核员可据此
- * 在网格着色上独立复核“终点不在可达集合内”。
+ * 从起点做广度优先，返回可达的非阻断格位图与数量。阻断格与终点
+ * 所在的另一片开放区域都不会计入“可达”，审核员可逐格着色核对：
+ *   总格数 = 阻断格数 + 起点可达格数 + 其它开放片区格数。
  */
-export function floodReachSet(grid: Grid, startPos: number): { seen: Uint8Array; count: number } {
-  const { rows, cols, cells } = grid
+export function floodReachSet(
+  grid: Grid,
+  startPos: number,
+): { seen: Uint8Array; count: number } {
+  const { cols, cells } = grid
   const seen = new Uint8Array(cells.length)
   if (startPos < 0 || startPos >= cells.length || cells[startPos].kind === 'blocked') {
     return { seen, count: 0 }
@@ -420,22 +628,25 @@ export function floodReachSet(grid: Grid, startPos: number): { seen: Uint8Array;
     }
   }
 
-  const queue: number[] = [startPos]
+  const queue = new Int32Array(cells.length)
+  let head = 0
+  let tail = 0
+  queue[tail++] = startPos
   seen[startPos] = 1
   let count = 0
-  while (queue.length > 0) {
-    const p = queue.shift()!
+  while (head < tail) {
+    const p = queue[head++]
     count++
     const r = (p / cols) | 0
     const c = p % cols
     for (const [dr, dc] of DIR_DELTA) {
       const nr = r + dr
       const nc = c + dc
-      if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue
+      if (nr < 0 || nr >= grid.rows || nc < 0 || nc >= cols) continue
       const np = nr * cols + nc
       if (!seen[np] && cells[np].kind !== 'blocked') {
         seen[np] = 1
-        queue.push(np)
+        queue[tail++] = np
       }
     }
     const g = groupOf[p]
@@ -443,7 +654,7 @@ export function floodReachSet(grid: Grid, startPos: number): { seen: Uint8Array;
       for (const np of members[g]) {
         if (!seen[np]) {
           seen[np] = 1
-          queue.push(np)
+          queue[tail++] = np
         }
       }
     }

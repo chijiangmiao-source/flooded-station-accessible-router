@@ -392,6 +392,28 @@ describe('不可达与失败证据', () => {
     expect(r.reachSeen[2 * 3 + 2]).toBe(0)
   })
 
+  it('失败证据区分三类：真正阻断格、起点可达开放格、另一片开放格', () => {
+    // 3×3：中间一竖列 3 格淹水，把站厅分成左右各 3 格的两片开放区。
+    // 起点在左片，终点在右片。阻断必须只数 3，不能把右片开放格算成淹水。
+    const g = grid(
+      3,
+      3,
+      [
+        normal(1), blocked(), normal(1),
+        normal(1), blocked(), normal(1),
+        normal(1), blocked(), normal(1),
+      ],
+    )
+    const r = solve(g, { startR: 1, startC: 0, goalR: 1, goalC: 2, startDir: 0 })
+    expect(r.reachable).toBe(false)
+    expect(r.blockedCount).toBe(3)
+    expect(r.reachableCount).toBe(3) // 左片
+    expect(g.cells.length - r.blockedCount - r.reachableCount).toBe(3) // 右片开放格
+    expect(r.reachSeen[1 * 3 + 0]).toBe(1) // 起点可达
+    expect(r.reachSeen[1 * 3 + 1]).toBe(0) // 阻断
+    expect(r.reachSeen[1 * 3 + 2]).toBe(0) // 另一片开放格，不计入可达
+  })
+
   it('同组电梯使被淹水隔开的格在连通统计中仍可达', () => {
     // 3×1：中间阻断，但首尾有同组电梯
     const g = grid(3, 1, [elev(1, 1, 5), blocked(), elev(1, 1, 5)])

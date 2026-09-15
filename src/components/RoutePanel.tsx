@@ -17,14 +17,23 @@ export function RoutePanel({ result, totalCells }: RoutePanelProps) {
               网格总格数：<b data-testid="total-cells">{totalCells}</b>
             </li>
             <li>
+              真正阻断（淹水封闭）格数：
+              <b data-testid="blocked-count" style={{ color: '#ff9d9b' }}>
+                {result.blockedCount}
+              </b>
+            </li>
+            <li>
               从起点可达格数：
               <b data-testid="reach-count" style={{ color: '#ff9d9b', fontSize: 16 }}>
                 {result.reachableCount}
               </b>
             </li>
             <li>
-              阻断格数：{totalCells - result.reachableCount}
-              ；终点不在蓝色描边的可达集合内（可逐格核对）。
+              与起点不连通的其它开放片区格数：
+              <b data-testid="other-open-count">
+                {totalCells - result.blockedCount - result.reachableCount}
+              </b>
+              （这些格没有淹水，只是被阻断格隔开——终点位于其中，不在蓝色描边的可达集合内，可逐格核对）
             </li>
           </ul>
         </div>

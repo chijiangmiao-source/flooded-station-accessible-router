@@ -98,4 +98,5 @@ export interface SolveResult {
   steps: RouteStep[] // reachable 为真时为最优路线
   reachableCount: number // 从起点可达的格数（按“格”计，与状态无关）
   reachSeen: Uint8Array // 可达格位图（逐格复核失败证据；阻断格为 0）
+  blockedCount: number // 网格中真正的阻断（淹水）格数
 }

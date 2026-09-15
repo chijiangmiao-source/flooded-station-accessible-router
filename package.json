@@ -11,7 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "e2e": "playwright test",
-    "verify": "npm run build && vitest run && playwright test"
+    "verify": "tsc --noEmit && vitest run && playwright test"
   },
   "dependencies": {
     "react": "18.3.1",

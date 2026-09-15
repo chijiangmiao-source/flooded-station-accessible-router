@@ -12,6 +12,20 @@
  *   - 同组电梯换乘：仅可从电梯格出发，到达同组任意另一部电梯，
  *     固定 8 秒，朝向不变；该组首次乘用额外加收一次等待秒数。
  *
+ * 连续推行上限（手动轮椅乘客，可选 1–999 秒）
+ * ------------------------------------------
+ * 启用上限后，求解状态除 (位置, 朝向, 已付费组) 外还携带当前连续推行
+ * 耗时 push，同一 (位置, 朝向, 已付费组) 下可共存多张帕累托最优标签：
+ *   - 每次正交移动把“目标格基础耗时 + 转弯费”计入 push；累计超过上限
+ *     的动作不得采用（并记录其超限秒数，供失败时报告最小超限）；
+ *   - 步行进入电梯格本身不计入 push（也不清零）；
+ *   - 同组电梯换乘的 8 秒换乘费与首次等待均不计入 push，且换乘到达后
+ *     push 清零。
+ * 标签 ℓ 支配标签 n（可安全裁剪 n）当且仅当 ℓ.push ≤ n.push 且
+ * (总秒数, 转弯数, 坐标序列) 三级不劣于 n：此时 n 的任何合法延续都能
+ * 被 ℓ 以不更差的三级指标复现。可行路线仍依次按总秒数、转弯数、
+ * 坐标序列裁决。未启用上限时走原有单标签 A*，行为与账目完全不变。
+ *
  * 实现要点
  * --------
  *  - 状态用稠密整数 sid 索引，距离/转弯/节点指针均为定长整型数组，
@@ -205,6 +219,15 @@ class NodeTree {
   }
 }
 
+/** 资源标签：受限搜索中同一 (位置, 朝向, 已付费组) 下的帕累托共存标签。 */
+interface RLabel {
+  push: number // 当前连续推行耗时（秒）
+  time: number
+  turns: number
+  node: number // 标签树节点
+  alive: boolean // 被支配裁剪后置 false，堆中对应条目随之作废
+}
+
 /** 最小二叉堆：A* 键 (f=g+h, sid)。 */
 interface HeapEntry {
   sid: number
@@ -212,6 +235,7 @@ interface HeapEntry {
   turns: number
   node: number
   f: number
+  label?: RLabel // 仅受限搜索使用：弹出时校验标签是否仍存活
 }
 
 class MinHeap {
@@ -268,6 +292,112 @@ export interface SolveOptions {
   goalR: number
   goalC: number
   startDir: Dir
+  /** 连续推行上限（秒，1–999）；null/undefined 表示不限制 */
+  pushLimit?: number | null
+}
+
+/** 同组电梯成员、等待秒数与压缩掩码位（一致性由校验层保证）。 */
+interface ElevatorModel {
+  members: number[][]
+  groupWait: Int32Array
+  groupLocal: Int8Array
+  masks: number
+}
+
+function buildElevatorModel(grid: Grid): ElevatorModel {
+  const { cells } = grid
+  const members: number[][] = []
+  const groupWait = new Int32Array(10)
+  const groupLocal = new Int8Array(10).fill(-1)
+  const presentGroups: number[] = []
+  for (let p = 0; p < cells.length; p++) {
+    const cell = cells[p]
+    if (cell.kind === 'elevator') {
+      ;(members[cell.group] ??= []).push(p)
+      groupWait[cell.group] = cell.wait
+      if (groupLocal[cell.group] < 0) {
+        groupLocal[cell.group] = presentGroups.length
+        presentGroups.push(cell.group)
+      }
+    }
+  }
+  // 掩码只按“实际出现的组”分配位，避免无电梯时状态无谓膨胀
+  return { members, groupWait, groupLocal, masks: 1 << presentGroups.length }
+}
+
+/**
+ * A* 可采纳启发值 h[pos]：在“只看位置”的松弛问题上（忽略朝向、
+ * 转弯费与首次等待，正交边按目标格耗时、同组电梯 8）到终点的最短
+ * 秒数。松弛问题的每条边费都不大于真实边费，故 h 是真实剩余费用
+ * 的下界，且满足一致性（h 本身是最短路距离）。推行上限只会删除
+ * 可行边，不会降低真实剩余费用，故启用上限时 h 依然可采纳、一致。
+ * 反向求解：从终点出发，松弛边 v→u 的权 = 正向 u→v 的目标格费
+ * cost(v)；同组电梯成员之间权 8。
+ */
+function computeHeuristic(grid: Grid, goalPos: number, members: number[][]): Float64Array {
+  const { rows, cols, cells } = grid
+  const h = new Float64Array(cells.length).fill(Infinity)
+  const pq: { p: number; d: number }[] = []
+  const pushPq = (p: number, d: number): void => {
+    pq.push({ p, d })
+    let i = pq.length - 1
+    while (i > 0 && pq[i].d < pq[(i - 1) >> 1].d) {
+      const pi = (i - 1) >> 1
+      ;[pq[i], pq[pi]] = [pq[pi], pq[i]]
+      i = pi
+    }
+  }
+  h[goalPos] = 0
+  pushPq(goalPos, 0)
+  while (pq.length > 0) {
+    let top = 0
+    const cur = pq[0]
+    const last = pq.pop()!
+    if (pq.length > 0) {
+      pq[0] = last
+      for (;;) {
+        const l = 2 * top + 1
+        const rr = l + 1
+        let m = top
+        if (l < pq.length && pq[l].d < pq[m].d) m = l
+        if (rr < pq.length && pq[rr].d < pq[m].d) m = rr
+        if (m === top) break
+        ;[pq[m], pq[top]] = [pq[top], pq[m]]
+        top = m
+      }
+    }
+    if (cur.d !== h[cur.p]) continue
+    const v = cur.p
+    const vr = (v / cols) | 0
+    const vc = v % cols
+    const forwardDestCost = cells[v].kind === 'blocked' ? 0 : (cells[v] as { cost: number }).cost
+    // 反向正交边：u→v 正向花费 cost(v)
+    for (const [dr, dc] of DIR_DELTA) {
+      const ur = vr + dr
+      const uc = vc + dc
+      if (ur < 0 || ur >= rows || uc < 0 || uc >= cols) continue
+      const u = ur * cols + uc
+      if (cells[u].kind === 'blocked') continue
+      const nd = cur.d + forwardDestCost
+      if (nd < h[u]) {
+        h[u] = nd
+        pushPq(u, nd)
+      }
+    }
+    // 反向同组电梯：费用 8
+    const vCell = cells[v]
+    if (vCell.kind === 'elevator') {
+      for (const u of members[vCell.group]) {
+        if (u === v) continue
+        const nd = cur.d + ELEVATOR_FARE
+        if (nd < h[u]) {
+          h[u] = nd
+          pushPq(u, nd)
+        }
+      }
+    }
+  }
+  return h
 }
 
 export function solve(grid: Grid, opt: SolveOptions): SolveResult {
@@ -275,6 +405,7 @@ export function solve(grid: Grid, opt: SolveOptions): SolveResult {
   const cellCount = cells.length
   const startPos = opt.startR * cols + opt.startC
   const goalPos = opt.goalR * cols + opt.goalC
+  const limit = opt.pushLimit ?? null
 
   const reach = floodReachSet(grid, startPos)
   let blockedCount = 0
@@ -287,6 +418,8 @@ export function solve(grid: Grid, opt: SolveOptions): SolveResult {
     reachableCount: reach.count,
     reachSeen: reach.seen,
     blockedCount,
+    pushLimit: limit,
+    minOver: 0,
   })
 
   if (cells[startPos].kind === 'blocked' || cells[goalPos].kind === 'blocked') {
@@ -300,95 +433,18 @@ export function solve(grid: Grid, opt: SolveOptions): SolveResult {
     return fail()
   }
 
-  // 同组电梯成员与等待秒数（一致性由校验层保证）。
-  // 掩码只按“实际出现的组”分配位，避免无电梯时状态无谓膨胀。
-  const members: number[][] = []
-  const groupWait = new Int32Array(10)
-  const groupLocal = new Int8Array(10).fill(-1)
-  const presentGroups: number[] = []
-  for (let p = 0; p < cellCount; p++) {
-    const cell = cells[p]
-    if (cell.kind === 'elevator') {
-      ;(members[cell.group] ??= []).push(p)
-      groupWait[cell.group] = cell.wait
-      if (groupLocal[cell.group] < 0) {
-        groupLocal[cell.group] = presentGroups.length
-        presentGroups.push(cell.group)
-      }
-    }
-  }
-  const masks = 1 << presentGroups.length // 0 组时为 1
+  const { members, groupWait, groupLocal, masks } = buildElevatorModel(grid)
+  const h = computeHeuristic(grid, goalPos, members)
 
-  /**
-   * A* 可采纳启发值 h[pos]：在“只看位置”的松弛问题上（忽略朝向、
-   * 转弯费与首次等待，正交边按目标格耗时、同组电梯 8）到终点的最短
-   * 秒数。松弛问题的每条边费都不大于真实边费，故 h 是真实剩余费用
-   * 的下界，且满足一致性（h 本身是最短路距离）。
-   * 反向求解：从终点出发，松弛边 v→u 的权 = 正向 u→v 的目标格费
-   * cost(v)；同组电梯成员之间权 8。
-   */
-  const h = new Float64Array(cellCount).fill(Infinity)
-  {
-    const pq: { p: number; d: number }[] = []
-    const pushPq = (p: number, d: number): void => {
-      pq.push({ p, d })
-      let i = pq.length - 1
-      while (i > 0 && pq[i].d < pq[(i - 1) >> 1].d) {
-        const pi = (i - 1) >> 1
-        ;[pq[i], pq[pi]] = [pq[pi], pq[i]]
-        i = pi
-      }
-    }
-    h[goalPos] = 0
-    pushPq(goalPos, 0)
-    while (pq.length > 0) {
-      let top = 0
-      const cur = pq[0]
-      const last = pq.pop()!
-      if (pq.length > 0) {
-        pq[0] = last
-        for (;;) {
-          const l = 2 * top + 1
-          const rr = l + 1
-          let m = top
-          if (l < pq.length && pq[l].d < pq[m].d) m = l
-          if (rr < pq.length && pq[rr].d < pq[m].d) m = rr
-          if (m === top) break
-          ;[pq[m], pq[top]] = [pq[top], pq[m]]
-          top = m
-        }
-      }
-      if (cur.d !== h[cur.p]) continue
-      const v = cur.p
-      const vr = (v / cols) | 0
-      const vc = v % cols
-      const forwardDestCost = cells[v].kind === 'blocked' ? 0 : (cells[v] as { cost: number }).cost
-      // 反向正交边：u→v 正向花费 cost(v)
-      for (const [dr, dc] of DIR_DELTA) {
-        const ur = vr + dr
-        const uc = vc + dc
-        if (ur < 0 || ur >= rows || uc < 0 || uc >= cols) continue
-        const u = ur * cols + uc
-        if (cells[u].kind === 'blocked') continue
-        const nd = cur.d + forwardDestCost
-        if (nd < h[u]) {
-          h[u] = nd
-          pushPq(u, nd)
-        }
-      }
-      // 反向同组电梯：费用 8
-      const vCell = cells[v]
-      if (vCell.kind === 'elevator') {
-        for (const u of members[vCell.group]) {
-          if (u === v) continue
-          const nd = cur.d + ELEVATOR_FARE
-          if (nd < h[u]) {
-            h[u] = nd
-            pushPq(u, nd)
-          }
-        }
-      }
-    }
+  // 启用连续推行上限：走资源约束多标签搜索
+  if (limit !== null) {
+    return solveWithPushLimit(grid, opt, limit, reach, blockedCount, {
+      members,
+      groupWait,
+      groupLocal,
+      masks,
+      h,
+    })
   }
 
   // sid = (pos*4 + dir)*masks + mask
@@ -538,10 +594,249 @@ export function solve(grid: Grid, opt: SolveOptions): SolveResult {
     reachableCount: reach.count,
     reachSeen: reach.seen,
     blockedCount,
+    pushLimit: null,
+    minOver: 0,
   }
 }
 
-/** 沿不可变父节点链还原逐步费用明细与累计值。 */
+interface ConstrainedCtx {
+  members: number[][]
+  groupWait: Int32Array
+  groupLocal: Int8Array
+  masks: number
+  h: Float64Array
+}
+
+/**
+ * 启用连续推行上限时的资源约束搜索。
+ *
+ * 状态为 (位置, 朝向, 已付费组, 推行耗时)。同一 (位置, 朝向, 已付费组)
+ * 下按 push 资源保留帕累托前沿：标签 ℓ 支配 n ⟺ ℓ.push ≤ n.push 且
+ * (总秒数, 转弯数, 坐标序列) 三级不劣于 n。被支配标签的合法延续必能
+ * 被支配者以不更差的三级指标复现，故裁剪安全。
+ *
+ * 推行账目：正交移动到普通格计入“目标格耗时 + 转弯费”；步行进入电梯
+ * 格不计入（也不清零）；同组电梯换乘的 8 秒与首次等待不计入，且换乘
+ * 到达后 push 清零。任何使 push 超过 limit 的动作不得采用，其超限秒数
+ * 参与“最小超限”统计，供受限失败时报告。
+ *
+ * 失败时返回约束下实际到达过的格集合（而非拓扑可达集），以及所有被拒
+ * 动作中的最小超限秒数。
+ */
+function solveWithPushLimit(
+  grid: Grid,
+  opt: SolveOptions,
+  limit: number,
+  reach: { seen: Uint8Array; count: number },
+  blockedCount: number,
+  ctx: ConstrainedCtx,
+): SolveResult {
+  const { rows, cols, cells } = grid
+  const cellCount = cells.length
+  const startPos = opt.startR * cols + opt.startC
+  const goalPos = opt.goalR * cols + opt.goalC
+  const { members, groupWait, groupLocal, masks, h } = ctx
+
+  // sid = (pos*4 + dir)*masks + mask；push 资源体现在标签上，不进 sid
+  const stateCount = cellCount * 4 * masks
+  const sidOf = (pos: number, dir: Dir, mask: number): number =>
+    (pos * 4 + dir) * masks + mask
+
+  const labels: (RLabel[] | undefined)[] = new Array<RLabel[] | undefined>(stateCount)
+  const reached = new Uint8Array(cellCount) // 约束下实际到达过的格
+  reached[startPos] = 1
+  let minOver = Infinity
+
+  const tree = new NodeTree()
+  const heap = new MinHeap()
+
+  const startSid = sidOf(startPos, opt.startDir, 0)
+  const startNode = tree.add(startPos, -1, VIA_WALK, 0, 0, 0, 0, 0)
+  const startLabel: RLabel = { push: 0, time: 0, turns: 0, node: startNode, alive: true }
+  labels[startSid] = [startLabel]
+  heap.push({ sid: startSid, time: 0, turns: 0, node: startNode, f: h[startPos], label: startLabel })
+
+  const relax = (
+    from: RLabel,
+    npos: number,
+    ndir: Dir,
+    nmask: number,
+    edgeTime: number,
+    edgeTurns: number,
+    npush: number,
+    via: number,
+    base: number,
+    turn: number,
+    fare: number,
+    wait: number,
+    group: number,
+  ): void => {
+    const nsid = sidOf(npos, ndir, nmask)
+    const nt = from.time + edgeTime
+    const ntn = from.turns + edgeTurns
+    let list = labels[nsid]
+
+    // 支配检查：既有标签 ℓ 满足 ℓ.push ≤ npush 且三级不劣于候选时，
+    // 候选的任何延续都能被 ℓ 复现且不更差，不予采用
+    if (list !== undefined) {
+      for (const L of list) {
+        if (!L.alive || L.push > npush) continue
+        if (
+          L.time < nt ||
+          (L.time === nt && L.turns < ntn) ||
+          (L.time === nt &&
+            L.turns === ntn &&
+            tree.compareExtension(from.node, npos, L.node) >= 0)
+        ) {
+          return
+        }
+      }
+    }
+
+    // 仅对被采纳的标签创建节点：不可变、永不被改写
+    const node = tree.add(npos, from.node, via, base, turn, fare, wait, group)
+    const nl: RLabel = { push: npush, time: nt, turns: ntn, node, alive: true }
+    if (list === undefined) {
+      list = []
+      labels[nsid] = list
+    }
+    // 清除被候选支配的既有标签（其延续均可由候选复现）
+    for (let i = list.length - 1; i >= 0; i--) {
+      const L = list[i]
+      if (!L.alive) {
+        list.splice(i, 1)
+        continue
+      }
+      if (npush > L.push) continue
+      if (
+        nt < L.time ||
+        (nt === L.time && ntn < L.turns) ||
+        (nt === L.time && ntn === L.turns && tree.compareSeq(node, L.node) <= 0)
+      ) {
+        L.alive = false
+        list.splice(i, 1)
+      }
+    }
+    list.push(nl)
+    reached[npos] = 1
+    heap.push({ sid: nsid, time: nt, turns: ntn, node, f: nt + h[npos], label: nl })
+  }
+
+  let goalBestTime = INF
+  let goalBestTurns = INF
+  let goalBestNode = -1
+
+  while (heap.size > 0) {
+    const e = heap.pop()
+    if (e.label === undefined || !e.label.alive) continue // 已被支配裁剪
+
+    // 与无限制路径相同的 A* 终止：h 一致且非负
+    if (goalBestNode >= 0 && e.f > goalBestTime) break
+
+    const mask = e.sid % masks
+    const q = (e.sid / masks) | 0
+    const dir = (q % 4) as Dir
+    const pos = (q / 4) | 0
+
+    if (pos === goalPos) {
+      let take = false
+      if (goalBestNode < 0) take = true
+      else if (e.time !== goalBestTime) take = e.time < goalBestTime
+      else if (e.turns !== goalBestTurns) take = e.turns < goalBestTurns
+      else take = tree.compareSeq(e.node, goalBestNode) < 0
+      if (take) {
+        goalBestTime = e.time
+        goalBestTurns = e.turns
+        goalBestNode = e.node
+      }
+      continue // 终点不再扩展（边费用为正）
+    }
+
+    const r = (pos / cols) | 0
+    const c = pos % cols
+    const curPush = e.label.push
+
+    // 1) 四向正交移动：目标格基础耗时与转弯费计入连续推行耗时；
+    //    步行进入电梯格不计入；超过上限的动作不得采用
+    for (let d = 0 as Dir; d < 4; d = (d + 1) as Dir) {
+      const [dr, dc] = DIR_DELTA[d]
+      const nr = r + dr
+      const nc = c + dc
+      if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue
+      const np = nr * cols + nc
+      const target = cells[np]
+      if (target.kind === 'blocked') continue
+      const turned = d !== dir
+      const stepPush =
+        target.kind === 'elevator' ? 0 : target.cost + (turned ? TURN_PENALTY : 0)
+      const npush = curPush + stepPush
+      if (npush > limit) {
+        const over = npush - limit
+        if (over < minOver) minOver = over
+        continue
+      }
+      relax(
+        e.label,
+        np, d, mask,
+        target.cost + (turned ? TURN_PENALTY : 0),
+        turned ? 1 : 0,
+        npush,
+        VIA_WALK, target.cost, turned ? TURN_PENALTY : 0, 0, 0, 0,
+      )
+    }
+
+    // 2) 同组电梯换乘：8 秒换乘费与首次等待不计入推行；到达后清零
+    const here = cells[pos]
+    if (here.kind === 'elevator') {
+      const g = here.group
+      const bit = 1 << groupLocal[g]
+      const first = (mask & bit) === 0
+      const wait = first ? groupWait[g] : 0
+      const nmask = mask | bit
+      for (const np of members[g]) {
+        if (np === pos) continue
+        relax(
+          e.label,
+          np, dir, nmask,
+          ELEVATOR_FARE + wait, 0,
+          0,
+          VIA_RIDE, 0, 0, ELEVATOR_FARE + wait, wait, g,
+        )
+      }
+    }
+  }
+
+  if (goalBestNode < 0) {
+    // 拓扑可达但受推行上限约束失败：报告约束下到达集与最小超限秒数
+    let count = 0
+    for (let i = 0; i < cellCount; i++) count += reached[i]
+    return {
+      reachable: false,
+      total: 0,
+      turns: 0,
+      steps: [],
+      reachableCount: count,
+      reachSeen: reached,
+      blockedCount,
+      pushLimit: limit,
+      minOver: minOver === Infinity ? 0 : minOver,
+    }
+  }
+
+  return {
+    reachable: true,
+    total: goalBestTime,
+    turns: goalBestTurns,
+    steps: buildSteps(tree, goalBestNode, grid, opt.startDir),
+    reachableCount: reach.count,
+    reachSeen: reach.seen,
+    blockedCount,
+    pushLimit: limit,
+    minOver: 0,
+  }
+}
+
+/** 沿不可变父节点链还原逐步费用明细与累计值（含连续推行累计）。 */
 function buildSteps(tree: NodeTree, goalNode: number, grid: Grid, startDir: Dir): RouteStep[] {
   const ids: number[] = []
   let n = goalNode
@@ -554,6 +849,7 @@ function buildSteps(tree: NodeTree, goalNode: number, grid: Grid, startDir: Dir)
   const { cells, cols } = grid
   const out: RouteStep[] = []
   let total = 0
+  let push = 0
   let curDir: Dir = startDir
   for (let i = 0; i < ids.length; i++) {
     const id = ids[i]
@@ -563,24 +859,28 @@ function buildSteps(tree: NodeTree, goalNode: number, grid: Grid, startDir: Dir)
     if (i === 0) {
       out.push({
         r, c, dir: curDir,
-        base: 0, turn: 0, fare: 0, wait: 0, stepCost: 0, total: 0,
+        base: 0, turn: 0, fare: 0, wait: 0, stepCost: 0, total: 0, push: 0,
         kind: 'start',
       })
       continue
     }
     const via = tree.via.get(id)
+    const here = cells[pos]
     if (via === VIA_WALK) {
       const prevPos = tree.pos.get(ids[i - 1])
       const dr = r - ((prevPos / cols) | 0)
       const dc = c - (prevPos % cols)
       curDir = DIR_DELTA.findIndex(([x, y]) => x === dr && y === dc) as Dir
+      // 步行进入电梯格不计入推行耗时；进入普通格累加基础耗时与转弯费
+      if (here.kind !== 'elevator') push += tree.base.get(id) + tree.turn.get(id)
+    } else {
+      // 同组电梯换乘到达后，连续推行耗时清零
+      push = 0
     }
-    // 乘梯不改变朝向：curDir 保持
     const base = tree.base.get(id)
     const turn = tree.turn.get(id)
     const fare = tree.fare.get(id)
     total += base + turn + fare
-    const here = cells[pos]
     out.push({
       r,
       c,
@@ -591,6 +891,7 @@ function buildSteps(tree: NodeTree, goalNode: number, grid: Grid, startDir: Dir)
       wait: tree.wait.get(id),
       stepCost: base + turn + fare,
       total,
+      push,
       kind: via === VIA_RIDE ? 'elevator' : 'walk',
       group: via === VIA_RIDE ? tree.group.get(id) : undefined,
       enteredGroup:

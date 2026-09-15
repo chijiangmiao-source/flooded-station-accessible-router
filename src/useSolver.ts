@@ -9,6 +9,7 @@ export interface SolveArgs {
   goalR: number
   goalC: number
   startDir: Dir
+  pushLimit: number | null // 连续推行上限（秒）；null 表示不限制
 }
 
 /**

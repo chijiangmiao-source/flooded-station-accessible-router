@@ -96,3 +96,71 @@ test.describe('点选起终点与不可达证据', () => {
     await expect(goalCell).toHaveAttribute('data-reachable', '0')
   })
 })
+
+test.describe('连续推行上限', () => {
+  test('受限成功：暴雨示例上限 11 秒仍得 46 秒路线，明细展示推行累计与乘梯清零', async ({ page }) => {
+    await page.getByTestId('push-limit-toggle').check()
+    await page.getByTestId('push-limit-input').fill('11')
+    await page.getByRole('button', { name: '求解 / 复核' }).first().click()
+
+    const result = page.getByTestId('result')
+    await expect(result).toHaveAttribute('data-reachable', 'true')
+    await expect(page.getByTestId('total')).toHaveText('46')
+    await expect(page.getByTestId('turns')).toHaveText('2')
+    await expect(page.getByTestId('push-limit')).toHaveText('11')
+    await expect(page.locator('table.steps thead')).toContainText('推行累计')
+
+    // 路线（1 基）：(5,1)→(4,1)→(3,1)→(2,1)→(2,2)梯→乘→(2,5)→(2,6)→(1,6)
+    // 推行累计：3, 6, 9, 9(入梯不计), 0(乘梯清零), 3, 11(转弯5+耗时3)
+    const rows = page.locator('table.steps tbody tr')
+    await expect(rows).toHaveCount(8)
+    const pushOf = (i: number) => rows.nth(i).locator('td').nth(10)
+    await expect(pushOf(3)).toHaveText('9')
+    await expect(pushOf(4)).toHaveText('9（入梯不计）')
+    await expect(pushOf(5)).toHaveText('0（乘梯清零）')
+    await expect(pushOf(6)).toHaveText('3')
+    await expect(pushOf(7)).toHaveText('11')
+
+    // 编辑上限立即作废分析结果
+    await page.getByTestId('push-limit-input').fill('12')
+    await expect(page.getByTestId('result')).toHaveCount(0)
+  })
+
+  test('耐力失败：上限 8 秒时纯步行 3×3 无解，报告最小超限并标出约束到达集', async ({ page }) => {
+    await page.getByRole('button', { name: '载入纯步行示例' }).click()
+    await page.getByTestId('push-limit-toggle').check()
+    await page.getByTestId('push-limit-input').fill('8')
+    await page.getByRole('button', { name: '求解 / 复核' }).first().click()
+
+    const result = page.getByTestId('result')
+    await expect(result).toHaveAttribute('data-reachable', 'false')
+    await expect(result).toContainText('超出连续推行上限')
+    await expect(page.getByTestId('min-over')).toHaveText('1') // 末步推行将达 9 秒，超 1 秒
+    await expect(page.getByTestId('reach-count')).toHaveText('8') // 除终点外 8 格可推行到达
+    // 终点 (1,3) 不在约束到达集内；(1,2) 在
+    await expect(page.locator('.cell[data-r="0"][data-c="2"]')).toHaveAttribute('data-reachable', '0')
+    await expect(page.locator('.cell[data-r="0"][data-c="1"]')).toHaveAttribute('data-reachable', '1')
+    // 旧路线已清空：无步骤表
+    await expect(page.locator('table.steps')).toHaveCount(0)
+  })
+
+  test('关闭限制后恢复原有无约束路线', async ({ page }) => {
+    await page.getByRole('button', { name: '载入纯步行示例' }).click()
+    // 先开限制：上限 8 秒失败
+    await page.getByTestId('push-limit-toggle').check()
+    await page.getByTestId('push-limit-input').fill('8')
+    await page.getByRole('button', { name: '求解 / 复核' }).first().click()
+    await expect(page.getByTestId('result')).toHaveAttribute('data-reachable', 'false')
+
+    // 关闭限制：失败结果立即作废
+    await page.getByTestId('push-limit-toggle').uncheck()
+    await expect(page.getByTestId('result')).toHaveCount(0)
+
+    // 重新求解：恢复 9 秒无约束路线，且不再展示推行累计列
+    await page.getByRole('button', { name: '求解 / 复核' }).first().click()
+    await expect(page.getByTestId('result')).toHaveAttribute('data-reachable', 'true')
+    await expect(page.getByTestId('total')).toHaveText('9')
+    await expect(page.getByTestId('turns')).toHaveText('1')
+    await expect(page.locator('table.steps thead')).not.toContainText('推行累计')
+  })
+})

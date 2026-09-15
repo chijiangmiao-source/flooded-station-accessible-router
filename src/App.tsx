@@ -8,11 +8,14 @@ import {
   FieldError,
   MAX_COST,
   MAX_DIM,
+  MAX_PUSH_LIMIT,
   MIN_DIM,
+  MIN_PUSH_LIMIT,
   RawCell,
   RawDoc,
   checkEndpoints,
   defaultCell,
+  parsePushLimit,
   validateDoc,
 } from './validation'
 import { Dir } from './types'
@@ -35,6 +38,9 @@ export default function App() {
   })
   const [selected, setSelected] = useState<number | null>(null)
   const [pickMode, setPickMode] = useState<PickMode>(null)
+  // 连续推行上限：手动轮椅乘客的耐力约束；关闭时不限制
+  const [pushLimitEnabled, setPushLimitEnabled] = useState(false)
+  const [pushLimitRaw, setPushLimitRaw] = useState('60')
   // 求解在 Web Worker 中进行；任何编辑调用 clear() 让旧路线立即消失
   const { busy, result, run, clear } = useSolver()
 
@@ -42,6 +48,10 @@ export default function App() {
 
   /** 任何会改变问题的编辑都必须让旧路线立即消失（并作废迟到的 Worker 结果）。 */
   const invalidate = (): void => clear()
+
+  // 上限输入非法（开启但非 1–999 整数）时禁止求解
+  const pushLimit = pushLimitEnabled ? parsePushLimit(pushLimitRaw) : null
+  const pushLimitInvalid = pushLimitEnabled && pushLimit === null
 
   const badFields = useMemo(() => {
     const m = new Map<number, Set<string>>()
@@ -136,6 +146,7 @@ export default function App() {
   const runSolve = (): void => {
     if (!validated.grid) return // 字段非法时不求解
     if (endpointIssues.length > 0) return
+    if (pushLimitInvalid) return // 上限输入非法时不求解
     const { start, goal, dir } = endpoints
     run(validated.grid, {
       startR: start!.r,
@@ -143,6 +154,7 @@ export default function App() {
       goalR: goal!.r,
       goalC: goal!.c,
       startDir: dir,
+      pushLimit,
     })
   }
 
@@ -319,6 +331,45 @@ export default function App() {
                   setEndpoints((ep) => ({ ...ep, dir: d }))
                 }}
               />
+              <label>连续推行上限</label>
+              <div>
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    data-testid="push-limit-toggle"
+                    checked={pushLimitEnabled}
+                    onChange={(e) => {
+                      invalidate()
+                      setPushLimitEnabled(e.target.checked)
+                    }}
+                  />
+                  限制连续推行（手动轮椅）
+                </label>
+                <input
+                  id="push-limit-input"
+                  data-testid="push-limit-input"
+                  type="text"
+                  inputMode="numeric"
+                  style={{ width: 64, marginLeft: 8 }}
+                  className={pushLimitInvalid ? 'invalid' : ''}
+                  disabled={!pushLimitEnabled}
+                  value={pushLimitRaw}
+                  onChange={(e) => {
+                    if (!/^\d{0,3}$/.test(e.target.value)) return
+                    invalidate()
+                    setPushLimitRaw(e.target.value)
+                  }}
+                />
+                <span className="muted">
+                  {' '}
+                  秒（{MIN_PUSH_LIMIT}–{MAX_PUSH_LIMIT}）；超过上限的推行动作不予采用，乘梯后清零
+                </span>
+                {pushLimitInvalid && (
+                  <div className="field-err" data-testid="push-limit-error">
+                    连续推行上限须为 {MIN_PUSH_LIMIT}–{MAX_PUSH_LIMIT} 的整数秒，或关闭限制
+                  </div>
+                )}
+              </div>
             </div>
             {endpointIssues.length > 0 && (
               <div className="notice-warn" data-testid="endpoint-warn" style={{ marginTop: 10 }}>
@@ -333,7 +384,7 @@ export default function App() {
               type="button"
               data-action="solve-2"
               onClick={runSolve}
-              disabled={hasFieldErrors || endpointIssues.length > 0}
+              disabled={hasFieldErrors || endpointIssues.length > 0 || pushLimitInvalid}
               style={{ marginTop: 12, width: '100%' }}
             >
               求解 / 复核

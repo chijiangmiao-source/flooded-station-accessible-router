@@ -63,16 +63,20 @@ export function cellAt(g: Grid, r: number, c: number): Cell {
   return g.cells[r * g.cols + c]
 }
 
-/** 求解状态必须包含：位置、朝向、已付费电梯组集合。 */
+/**
+ * 求解状态必须包含：位置、朝向、已付费电梯组集合；
+ * 启用连续推行上限时还需携带当前连续推行耗时（秒）。
+ */
 export interface State {
   pos: number // cells 下标
   dir: Dir
   paid: number // 位掩码：第 g 位置 1 表示组 g 的首次等待已付
+  push: number // 当前连续推行耗时（0..999；未启用上限时恒为 0）
 }
 
 export function stateKey(s: State): number {
-  // pos 最多 400（9 bit），dir 2 bit，paid 9 bit —— 20 bit，安全放入整数
-  return s.pos | (s.dir << 12) | (s.paid << 14)
+  // pos 最多 400、dir 4 档、paid 最多 512、push 最多 999 —— 安全放入整数
+  return ((s.push * 512 + s.paid) * 4 + s.dir) * 1024 + s.pos
 }
 
 /** 路线中的一步（从第 0 步的起点开始）。 */
@@ -86,6 +90,7 @@ export interface RouteStep {
   wait: number // 其中首次等待部分（fare 的子项，便于界面分列展示）
   stepCost: number // base + turn + fare
   total: number // 到达此步后的累计总秒数
+  push: number // 到达此步后的连续推行累计：步行入普通格累加 base+turn；步行入电梯格不变；乘梯到达清零
   kind: 'start' | 'walk' | 'elevator'
   group?: number // 电梯换乘时的组号
   enteredGroup?: number // 走入电梯格时的组号（普通乘用一步）
@@ -96,7 +101,9 @@ export interface SolveResult {
   total: number // 总秒数（不可达为 0）
   turns: number // 转弯数（不可达为 0）
   steps: RouteStep[] // reachable 为真时为最优路线
-  reachableCount: number // 从起点可达的格数（按“格”计，与状态无关）
+  reachableCount: number // 可达格数：拓扑可达；受限失败时为推行约束下实际到达的格数
   reachSeen: Uint8Array // 可达格位图（逐格复核失败证据；阻断格为 0）
   blockedCount: number // 网格中真正的阻断（淹水）格数
+  pushLimit: number | null // 本次求解的连续推行上限（秒）；null 表示未启用
+  minOver: number // 受限失败时所有被拒动作中的最小超限秒数；其余情形为 0
 }

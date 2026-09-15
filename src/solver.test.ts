@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { floodReach, solve } from './solver'
+import { floodReach, floodReachSet, solve } from './solver'
 import {
   Cell,
   Dir,
@@ -153,12 +153,18 @@ function spfaOracle(
   return { time: bestTime, turns: bestTurn, reachable: true }
 }
 
-/** 独立重放求解器给出的逐步路线，校验账目、朝向与电梯规则。 */
-function replay(g: Grid, startDir: Dir, result: ReturnType<typeof solve>): void {
+/** 独立重放求解器给出的逐步路线，校验账目、朝向、电梯规则与推行累计。 */
+function replay(
+  g: Grid,
+  startDir: Dir,
+  result: ReturnType<typeof solve>,
+  limit: number | null = null,
+): void {
   const { cols, cells } = g
   expect(result.steps.length).toBeGreaterThan(0)
   const firstWaitUsed = new Set<number>()
   let total = 0
+  let push = 0
   result.steps.forEach((s, i) => {
     total += s.stepCost
     expect(s.total).toBe(total)
@@ -166,6 +172,7 @@ function replay(g: Grid, startDir: Dir, result: ReturnType<typeof solve>): void 
       expect(s.kind).toBe('start')
       expect(s.stepCost).toBe(0)
       expect(s.dir).toBe(startDir)
+      expect(s.push).toBe(0)
       return
     }
     const prev = result.steps[i - 1]
@@ -184,6 +191,8 @@ function replay(g: Grid, startDir: Dir, result: ReturnType<typeof solve>): void 
       expect(s.turn).toBe(turned ? TURN_PENALTY : 0)
       expect(s.fare).toBe(0)
       expect(s.wait).toBe(0)
+      // 推行账目：步行进入电梯格不计入；进入普通格累加基础耗时与转弯费
+      if (target.kind !== 'elevator') push += s.base + s.turn
     } else {
       // 电梯换乘：两端同组、朝向不变、固定 8 秒
       expect(s.kind).toBe('elevator')
@@ -202,7 +211,11 @@ function replay(g: Grid, startDir: Dir, result: ReturnType<typeof solve>): void 
         firstWaitUsed.add(s.group!)
         expect(s.wait).toBe((target as { wait: number }).wait)
       }
+      // 乘梯到达后连续推行清零（8 秒换乘费与首次等待均不计入）
+      push = 0
     }
+    expect(s.push).toBe(push)
+    if (limit !== null) expect(s.push).toBeLessThanOrEqual(limit)
   })
   expect(result.total).toBe(total)
   let turns = 0
@@ -617,5 +630,482 @@ describe('坐标序列字典序穷举交叉验证', () => {
       }
     }
     expect(checked).toBeGreaterThan(20)
+  })
+})
+
+/* ---------------- 连续推行上限：手算用例 ---------------- */
+
+describe('连续推行上限（手算）', () => {
+  it('直线走廊：上限恰好覆盖时成功，差 1 秒时失败并报最小超限', () => {
+    const g = grid(1, 4, [normal(1), normal(1), normal(1), normal(1)])
+    const ok = solve(g, { startR: 0, startC: 0, goalR: 0, goalC: 3, startDir: 1, pushLimit: 3 })
+    expect(ok.reachable).toBe(true)
+    expect(ok.total).toBe(3)
+    expect(ok.pushLimit).toBe(3)
+    expect(ok.minOver).toBe(0)
+    expect(ok.steps.map((s) => s.push)).toEqual([0, 1, 2, 3])
+    replay(g, 1, ok, 3)
+
+    const no = solve(g, { startR: 0, startC: 0, goalR: 0, goalC: 3, startDir: 1, pushLimit: 2 })
+    expect(no.reachable).toBe(false)
+    expect(no.steps).toEqual([]) // 旧路线清除
+    expect(no.pushLimit).toBe(2)
+    expect(no.minOver).toBe(1) // 最后一步推行将达 3 秒，超 2 秒上限 1 秒
+    expect(no.reachableCount).toBe(3) // 约束下到达 (0,0)(0,1)(0,2)
+    expect([...no.reachSeen]).toEqual([1, 1, 1, 0])
+  })
+
+  it('转弯费计入连续推行耗时', () => {
+    const g = grid(2, 2, [normal(1), normal(1), normal(1), normal(1)])
+    const ok = solve(g, { startR: 1, startC: 0, goalR: 0, goalC: 1, startDir: 3, pushLimit: 12 })
+    expect(ok.reachable).toBe(true)
+    expect(ok.total).toBe(12)
+    expect(ok.steps.map((s) => s.push)).toEqual([0, 6, 12]) // 每步 5 转弯 + 1 基础
+
+    const no = solve(g, { startR: 1, startC: 0, goalR: 0, goalC: 1, startDir: 3, pushLimit: 11 })
+    expect(no.reachable).toBe(false)
+    expect(no.minOver).toBe(1)
+    // (1,0) (0,0) (1,1) 可推行到达，(0,1) 需 12 秒推行而不可达
+    expect(no.reachableCount).toBe(3)
+    expect(no.reachSeen[0 * 2 + 1]).toBe(0)
+    expect(no.reachSeen[1 * 2 + 1]).toBe(1)
+  })
+
+  it('步行进入电梯格不计入推行耗时', () => {
+    // 1×2：直接进入电梯格，1 秒上限也不约束
+    const g2 = grid(1, 2, [normal(1), elev(5, 1, 10)])
+    const r2 = solve(g2, { startR: 0, startC: 0, goalR: 0, goalC: 1, startDir: 1, pushLimit: 1 })
+    expect(r2.reachable).toBe(true)
+    expect(r2.total).toBe(5)
+    expect(r2.steps[1]).toMatchObject({ kind: 'walk', enteredGroup: 1, push: 0 })
+
+    // 1×3：穿过电梯格，只有末段普通格计入推行
+    const g3 = grid(1, 3, [normal(4), elev(3, 1, 10), normal(4)])
+    const ok = solve(g3, { startR: 0, startC: 0, goalR: 0, goalC: 2, startDir: 1, pushLimit: 4 })
+    expect(ok.reachable).toBe(true)
+    expect(ok.total).toBe(7)
+    expect(ok.steps.map((s) => s.push)).toEqual([0, 0, 4])
+
+    const no = solve(g3, { startR: 0, startC: 0, goalR: 0, goalC: 2, startDir: 1, pushLimit: 3 })
+    expect(no.reachable).toBe(false)
+    expect(no.minOver).toBe(1)
+  })
+
+  it('同组电梯换乘到达后清零；8 秒换乘费与首次等待均不计入推行', () => {
+    // 1×7：推行 2 秒到电梯 → 乘梯 18 秒 → 再推行两段各 2 秒
+    const g = grid(1, 7, [
+      normal(1), normal(2), elev(1, 1, 10), normal(50), elev(1, 1, 10), normal(2), normal(2),
+    ])
+    const ok = solve(g, { startR: 0, startC: 0, goalR: 0, goalC: 6, startDir: 1, pushLimit: 4 })
+    expect(ok.reachable).toBe(true)
+    expect(ok.total).toBe(25) // 2 + 1(入梯基础耗时) + (8+10) + 2 + 2
+    // 乘梯步 push 归零（而非 +18），证明换乘费与首次等待不计入且到达后清零
+    expect(ok.steps.map((s) => s.push)).toEqual([0, 2, 2, 0, 2, 4])
+    expect(ok.steps[3]).toMatchObject({ kind: 'elevator', fare: 18, wait: 10, push: 0 })
+    replay(g, 1, ok, 4)
+
+    // 上限 3：若不清零，全程推行 2+2+2=6 必失败；清零后仅末段 4 秒超 1 秒
+    const no = solve(g, { startR: 0, startC: 0, goalR: 0, goalC: 6, startDir: 1, pushLimit: 3 })
+    expect(no.reachable).toBe(false)
+    expect(no.minOver).toBe(1)
+  })
+
+  it('拓扑不可达且开启上限时，仍报告拓扑可达证据（与关闭限制一致）', () => {
+    const g = grid(3, 1, [normal(1), blocked(), normal(1)])
+    const r = solve(g, { startR: 0, startC: 0, goalR: 2, goalC: 0, startDir: 0, pushLimit: 10 })
+    expect(r.reachable).toBe(false)
+    expect(r.reachableCount).toBe(1) // 拓扑可达集，而非约束到达集
+    expect(r.reachSeen[0]).toBe(1)
+    expect(r.minOver).toBe(0)
+    expect(r.pushLimit).toBe(10)
+  })
+
+  it('暴雨示例场景：上限 11 秒恰好通过 46 秒路线，10 秒失败并报最小超限', () => {
+    // 5×6：第 4 列整列阻断，1 组电梯在 (1,1)/(1,4)（0 基），首次等待 10
+    const cells: Cell[] = []
+    for (let r = 0; r < 5; r++) {
+      for (let c = 0; c < 6; c++) {
+        if (c === 3) cells.push(blocked())
+        else if ((r === 1 && c === 1) || (r === 1 && c === 4)) cells.push(elev(3, 1, 10))
+        else cells.push(normal(3))
+      }
+    }
+    const g = grid(5, 6, cells)
+    const o = { startR: 4, startC: 0, goalR: 0, goalC: 5, startDir: 0 as Dir }
+    const ok = solve(g, { ...o, pushLimit: 11 })
+    expect(ok.reachable).toBe(true)
+    expect(ok.total).toBe(46)
+    expect(ok.turns).toBe(2)
+    // 推行累计：入梯不计、乘梯清零、末步转弯费一并计入
+    expect(ok.steps.map((s) => s.push)).toEqual([0, 3, 6, 9, 9, 0, 3, 11])
+    replay(g, 0, ok, 11)
+
+    const no = solve(g, { ...o, pushLimit: 10 })
+    expect(no.reachable).toBe(false)
+    expect(no.minOver).toBe(1) // 末步推行将达 11 秒，超 10 秒上限 1 秒
+  })
+})
+
+/* ---------------- 推行资源帕累托支配与乘梯清零 ---------------- */
+
+describe('推行资源帕累托支配与乘梯清零', () => {
+  // 2×4：上路经电梯格（耗时 50 秒但推行不计），下路纯步行（省时但推行累积高）。
+  // 两路均未乘梯（已付费组同为 ∅），在终点形成竞争标签：
+  //   上路 time 52 / push 2；下路 time 20 / push 20 —— 互不支配，前沿必须共存。
+  const g = (): Grid =>
+    grid(2, 4, [
+      normal(1), elev(50, 1, 10), normal(1), normal(1),
+      normal(1), normal(1), normal(1), normal(1),
+    ])
+  const opt = { startR: 0, startC: 0, goalR: 0, goalC: 3, startDir: 1 as Dir }
+
+  it('上限 20：省时高推行路线可行，选 20 秒下路', () => {
+    const r = solve(g(), { ...opt, pushLimit: 20 })
+    expect(r.reachable).toBe(true)
+    expect(r.total).toBe(20)
+    expect(coords(r)).toEqual([
+      [0, 0], [1, 0], [1, 1], [1, 2], [1, 3], [0, 3],
+    ])
+    replay(g(), 1, r, 20)
+  })
+
+  it('上限 10：高推行路线被拒，帕累托前沿中的 52 秒低推行路线仍可用', () => {
+    const r = solve(g(), { ...opt, pushLimit: 10 })
+    expect(r.reachable).toBe(true)
+    expect(r.total).toBe(52)
+    expect(coords(r)).toEqual([
+      [0, 0], [0, 1], [0, 2], [0, 3],
+    ])
+    expect(r.steps.map((s) => s.push)).toEqual([0, 0, 1, 2]) // 步行入梯不计
+    replay(g(), 1, r, 10)
+  })
+
+  it('上限 1：两条竞争路线都被拒，失败并报最小超限 1 秒', () => {
+    const r = solve(g(), { ...opt, pushLimit: 1 })
+    expect(r.reachable).toBe(false)
+    expect(r.minOver).toBe(1)
+    expect(r.reachableCount).toBe(3) // (0,0) (0,1) (0,2)
+  })
+
+  it('乘梯清零抹平到达电梯前的推行差异', () => {
+    // 1×6：起点即电梯；步行推行峰 8，乘梯 13 秒但到达后重新从 0 累计
+    const g6 = grid(1, 6, [
+      elev(1, 1, 5), normal(1), normal(1), elev(1, 1, 5), normal(3), normal(3),
+    ])
+    const o6 = { startR: 0, startC: 0, goalR: 0, goalC: 5, startDir: 1 as Dir }
+    const walkFirst = solve(g6, { ...o6, pushLimit: 8 })
+    expect(walkFirst.reachable).toBe(true)
+    expect(walkFirst.total).toBe(9) // 步行 1+1+1+3+3
+    const rideOnly = solve(g6, { ...o6, pushLimit: 6 })
+    expect(rideOnly.reachable).toBe(true)
+    expect(rideOnly.total).toBe(19) // (8+5)+3+3；乘梯后推行从 0 重新累计
+    expect(rideOnly.steps.map((s) => s.push)).toEqual([0, 0, 3, 6])
+    replay(g6, 1, rideOnly, 6)
+  })
+})
+
+/* ---------------- 关闭限制时行为完全一致 ---------------- */
+
+describe('关闭限制与未启用完全一致', () => {
+  it('pushLimit 缺省/null 结果一致；上限不约束时三级裁决一致', () => {
+    const rand = rng(777)
+    let checked = 0
+    for (let t = 0; t < 40; t++) {
+      // 4×4 小网格，含电梯与阻断；单格 ≤9 秒，推行峰值远小于 999
+      const groupCount = 1 + Math.floor(rand() * 2)
+      const waits = Array.from({ length: groupCount }, () => 1 + Math.floor(rand() * 9))
+      const cells: Cell[] = []
+      for (let i = 0; i < 16; i++) {
+        const x = rand()
+        if (x < 0.15) cells.push(blocked())
+        else if (x < 0.3) cells.push(elev(1 + Math.floor(rand() * 9), 1 + Math.floor(rand() * groupCount), 0))
+        else cells.push(normal(1 + Math.floor(rand() * 9)))
+      }
+      cells.forEach((cell) => {
+        if (cell.kind === 'elevator') (cell as { wait: number }).wait = waits[cell.group - 1]
+      })
+      const g = grid(4, 4, cells)
+      const open: number[] = []
+      cells.forEach((cell, p) => cell.kind !== 'blocked' && open.push(p))
+      if (open.length < 2) continue
+      const a = open[Math.floor(rand() * open.length)]
+      let b = open[Math.floor(rand() * open.length)]
+      if (b === a) b = open[(open.indexOf(a) + 1) % open.length]
+      const dir = Math.floor(rand() * 4) as Dir
+      const o = {
+        startR: (a / 4) | 0, startC: a % 4,
+        goalR: (b / 4) | 0, goalC: b % 4,
+        startDir: dir,
+      }
+      const base = solve(g, o) // 缺省（未启用）
+      const nul = solve(g, { ...o, pushLimit: null })
+      const big = solve(g, { ...o, pushLimit: 999 }) // 上限不约束
+      expect(nul.reachable).toBe(base.reachable)
+      expect(nul.total).toBe(base.total)
+      expect(nul.turns).toBe(base.turns)
+      expect(coords(nul)).toEqual(coords(base))
+      expect(nul.pushLimit).toBeNull()
+      expect(big.reachable).toBe(base.reachable)
+      expect(big.total).toBe(base.total)
+      expect(big.turns).toBe(base.turns)
+      expect(coords(big)).toEqual(coords(base))
+      if (base.reachable) checked++
+    }
+    expect(checked).toBeGreaterThan(10)
+  })
+})
+
+/* ---------------- 推行上限：小网格穷举差分 ---------------- */
+
+interface PushBest {
+  time: number
+  turns: number
+  seq: number[] // pos 序列
+}
+
+/**
+ * 独立 oracle：在 (位置, 朝向, 已付费组, 推行耗时) 状态图上做队列
+ * Bellman-Ford，标签直接保存完整坐标序列，按 (总秒数, 转弯数, 序列)
+ * 三级字典序松弛。与标签树 A* 的实现完全独立。
+ */
+function pushOracle(
+  g: Grid,
+  startR: number,
+  startC: number,
+  goalR: number,
+  goalC: number,
+  startDir: Dir,
+  limit: number,
+): { reachable: boolean; time: number; turns: number; seq: number[]; reachSeen: Uint8Array } {
+  const { rows, cols, cells } = g
+  const N = cells.length
+  const startPos = startR * cols + startC
+  const goalPos = goalR * cols + goalC
+  const reachSeen = new Uint8Array(N)
+  const none = { reachable: false, time: 0, turns: 0, seq: [] as number[], reachSeen }
+  if (cells[startPos].kind === 'blocked' || cells[goalPos].kind === 'blocked') return none
+
+  const members = new Map<number, number[]>()
+  const waitOf = new Map<number, number>()
+  cells.forEach((cell, p) => {
+    if (cell.kind === 'elevator') {
+      if (!members.has(cell.group)) {
+        members.set(cell.group, [])
+        waitOf.set(cell.group, cell.wait)
+      }
+      members.get(cell.group)!.push(p)
+    }
+  })
+  const groups = [...members.keys()].sort((a, b) => a - b)
+  const groupIndex = new Map(groups.map((gg, i) => [gg, i]))
+  const masks = 1 << groups.length
+  const span = limit + 1
+  const id = (pos: number, dir: number, paid: number, push: number): number =>
+    ((pos * 4 + dir) * masks + paid) * span + push
+  const total = N * 4 * masks * span
+
+  const best: (PushBest | null)[] = new Array(total).fill(null)
+  const inQ = new Uint8Array(total)
+  const queue: number[] = []
+
+  const lexLess = (a: number[], b: number[]): boolean => {
+    const n = Math.min(a.length, b.length)
+    for (let i = 0; i < n; i++) {
+      if (a[i] !== b[i]) return a[i] < b[i]
+    }
+    return a.length > b.length // 前缀视为更大（+∞ 终结符），与求解器约定一致
+  }
+  const better = (cand: PushBest, old: PushBest | null): boolean =>
+    old === null ||
+    cand.time < old.time ||
+    (cand.time === old.time && cand.turns < old.turns) ||
+    (cand.time === old.time && cand.turns === old.turns && lexLess(cand.seq, old.seq))
+
+  const s0 = id(startPos, startDir, 0, 0)
+  best[s0] = { time: 0, turns: 0, seq: [startPos] }
+  queue.push(s0)
+  inQ[s0] = 1
+  reachSeen[startPos] = 1
+
+  while (queue.length > 0) {
+    const u = queue.shift()!
+    inQ[u] = 0
+    let x = u
+    const push = x % span
+    x = (x / span) | 0
+    const paid = x % masks
+    x = (x / masks) | 0
+    const dir = x % 4
+    x = (x / 4) | 0
+    const pos = x
+    const ub = best[u]!
+    const r = (pos / cols) | 0
+    const c = pos % cols
+
+    // 正交移动：目标格耗时与转弯费计入推行；步行入电梯格不计
+    for (let d = 0; d < 4; d++) {
+      const [dr, dc] = DIR_DELTA[d]
+      const nr = r + dr
+      const nc = c + dc
+      if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue
+      const np = nr * cols + nc
+      const t = cells[np]
+      if (t.kind === 'blocked') continue
+      const turned = d !== dir
+      const stepPush = t.kind === 'elevator' ? 0 : t.cost + (turned ? TURN_PENALTY : 0)
+      const npush = push + stepPush
+      if (npush > limit) continue // 超限动作不得采用
+      const v = id(np, d, paid, npush)
+      const cand: PushBest = {
+        time: ub.time + t.cost + (turned ? TURN_PENALTY : 0),
+        turns: ub.turns + (turned ? 1 : 0),
+        seq: [...ub.seq, np],
+      }
+      if (better(cand, best[v])) {
+        best[v] = cand
+        reachSeen[np] = 1
+        if (!inQ[v]) {
+          queue.push(v)
+          inQ[v] = 1
+        }
+      }
+    }
+
+    // 电梯换乘：8 秒与首次等待不计推行，到达后清零
+    const here = cells[pos]
+    if (here.kind === 'elevator') {
+      const gi = groupIndex.get(here.group)!
+      const bit = 1 << gi
+      const first = (paid & bit) === 0
+      const wait = first ? waitOf.get(here.group)! : 0
+      for (const np of members.get(here.group)!) {
+        if (np === pos) continue
+        const v = id(np, dir, paid | bit, 0)
+        const cand: PushBest = {
+          time: ub.time + ELEVATOR_FARE + wait,
+          turns: ub.turns,
+          seq: [...ub.seq, np],
+        }
+        if (better(cand, best[v])) {
+          best[v] = cand
+          reachSeen[np] = 1
+          if (!inQ[v]) {
+            queue.push(v)
+            inQ[v] = 1
+          }
+        }
+      }
+    }
+  }
+
+  let win: PushBest | null = null
+  for (let d = 0; d < 4; d++) {
+    for (let paid = 0; paid < masks; paid++) {
+      for (let push = 0; push <= limit; push++) {
+        const b = best[id(goalPos, d, paid, push)]
+        if (b && better(b, win)) win = b
+      }
+    }
+  }
+  if (!win) return none
+  return { reachable: true, time: win.time, turns: win.turns, seq: win.seq, reachSeen }
+}
+
+describe('推行上限小网格穷举差分', () => {
+  const cases: Array<{
+    g: Grid
+    sr: number
+    sc: number
+    gr: number
+    gc: number
+    dir: Dir
+    limit: number
+  }> = []
+  const rand = rng(20260917)
+  for (let t = 0; t < 150; t++) {
+    const rows = 2 + Math.floor(rand() * 3) // 2..4
+    const cols = 2 + Math.floor(rand() * 3)
+    const groupCount = 1 + Math.floor(rand() * 2)
+    const waits = Array.from({ length: groupCount }, () => 1 + Math.floor(rand() * 9))
+    const cells: Cell[] = []
+    for (let i = 0; i < rows * cols; i++) {
+      const x = rand()
+      if (x < 0.15) cells.push(blocked())
+      else if (x < 0.32) {
+        cells.push(elev(1 + Math.floor(rand() * 9), 1 + Math.floor(rand() * groupCount), 0))
+      } else cells.push(normal(1 + Math.floor(rand() * 9)))
+    }
+    cells.forEach((cell) => {
+      if (cell.kind === 'elevator') (cell as { wait: number }).wait = waits[cell.group - 1]
+    })
+    const g = grid(rows, cols, cells)
+    const open: number[] = []
+    cells.forEach((cell, p) => cell.kind !== 'blocked' && open.push(p))
+    if (open.length < 2) continue
+    const a = open[Math.floor(rand() * open.length)]
+    let b = open[Math.floor(rand() * open.length)]
+    if (b === a) b = open[(open.indexOf(a) + 1) % open.length]
+    cases.push({
+      g,
+      sr: (a / cols) | 0,
+      sc: a % cols,
+      gr: (b / cols) | 0,
+      gc: b % cols,
+      dir: Math.floor(rand() * 4) as Dir,
+      limit: 1 + Math.floor(rand() * 25), // 1..25 秒上限
+    })
+  }
+
+  it('随机小网格 × 随机上限：可达性、三级裁决与约束到达集和穷举一致', () => {
+    expect(cases.length).toBeGreaterThan(120)
+    let okCount = 0
+    let failCount = 0
+    let staminaFail = 0
+    for (const c of cases) {
+      const r = solve(c.g, {
+        startR: c.sr,
+        startC: c.sc,
+        goalR: c.gr,
+        goalC: c.gc,
+        startDir: c.dir,
+        pushLimit: c.limit,
+      })
+      const o = pushOracle(c.g, c.sr, c.sc, c.gr, c.gc, c.dir, c.limit)
+      expect(r.reachable).toBe(o.reachable)
+      if (r.reachable) {
+        okCount++
+        expect(r.total).toBe(o.time)
+        expect(r.turns).toBe(o.turns)
+        expect(coords(r)).toEqual(o.seq.map((p) => [(p / c.g.cols) | 0, p % c.g.cols]))
+        expect(r.pushLimit).toBe(c.limit)
+        replay(c.g, c.dir, r, c.limit)
+      } else {
+        failCount++
+        expect(r.steps).toEqual([])
+        expect(r.pushLimit).toBe(c.limit)
+        const goalPos = c.gr * c.g.cols + c.gc
+        const topo = floodReachSet(c.g, c.sr * c.g.cols + c.sc)
+        if (topo.seen[goalPos] === 0) {
+          // 拓扑不可达：证据为拓扑可达集，无超限统计
+          expect(r.minOver).toBe(0)
+          expect(r.reachableCount).toBe(topo.count)
+          expect([...r.reachSeen]).toEqual([...topo.seen])
+        } else {
+          // 拓扑可达但受限失败：证据为约束下到达集，与穷举逐格一致
+          staminaFail++
+          expect(r.minOver).toBeGreaterThan(0)
+          let oc = 0
+          for (let i = 0; i < c.g.cells.length; i++) {
+            expect(r.reachSeen[i]).toBe(o.reachSeen[i])
+            oc += o.reachSeen[i]
+          }
+          expect(r.reachableCount).toBe(oc)
+        }
+      }
+    }
+    // 三类情形都要充分出现
+    expect(okCount).toBeGreaterThan(20)
+    expect(failCount).toBeGreaterThan(20)
+    expect(staminaFail).toBeGreaterThan(10)
   })
 })

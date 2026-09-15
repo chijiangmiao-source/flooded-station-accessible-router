@@ -37,6 +37,8 @@ export const MIN_GROUP = 1
 export const MAX_GROUP = 9
 export const MIN_WAIT = 1
 export const MAX_WAIT = 99
+export const MIN_PUSH_LIMIT = 1
+export const MAX_PUSH_LIMIT = 999
 
 const INT_RE = /^\d+$/
 
@@ -45,6 +47,11 @@ function parseBoundedInt(raw: string, min: number, max: number): number | null {
   const v = Number(raw.trim())
   if (!Number.isSafeInteger(v) || v < min || v > max) return null
   return v
+}
+
+/** 解析连续推行上限输入：1–999 的整数秒；非法时返回 null。 */
+export function parsePushLimit(raw: string): number | null {
+  return parseBoundedInt(raw, MIN_PUSH_LIMIT, MAX_PUSH_LIMIT)
 }
 
 export function defaultCell(): RawCell {

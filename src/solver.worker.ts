@@ -13,6 +13,7 @@ export interface SolveRequest {
   goalR: number
   goalC: number
   startDir: Dir
+  pushLimit: number | null // 连续推行上限（秒）；null 表示不限制
 }
 
 export interface SolveResponse {
@@ -35,6 +36,7 @@ scope.onmessage = (ev) => {
     goalR: req.goalR,
     goalC: req.goalC,
     startDir: req.startDir,
+    pushLimit: req.pushLimit,
   })
   scope.postMessage({ id: req.id, result })
 }
